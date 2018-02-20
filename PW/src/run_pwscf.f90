@@ -153,8 +153,6 @@ SUBROUTINE run_pwscf ( exit_status )
      !
      IF ( lstres ) CALL stress ( sigma )
      !
-     ! ... send out forces to MM code in QM/MM run
-     !
      IF ( lmd .OR. lbfgs ) THEN
         !
         if (fix_volume) CALL impose_deviatoric_stress(sigma)
@@ -178,6 +176,8 @@ SUBROUTINE run_pwscf ( exit_status )
      END IF
      !
      CALL stop_clock( 'ions' ); !write(*,*)' stop ions' ; FLUSH(6)
+     !
+     ! ... send out forces to MM code in QM/MM run
      !
      CALL qmmm_update_forces( force, rho%of_r, nspin, dfftp)
      !

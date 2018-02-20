@@ -49,13 +49,19 @@ MODULE qmmm
   ! convert forces to LAMMPS "real" units
   REAL(DP), PARAMETER :: QMMM_FORCE_CONV = 592.91102087727177_DP
   !
-  ! Number of atoms of the QM/MM systems
   ! buffer for converting forces and positions
   REAL(DP), ALLOCATABLE  :: tmp_buf(:,:)
   ! center of mass of the system
   REAL(DP), DIMENSION(3) :: r0 = (/ 0.0_DP, 0.0_DP, 0.0_DP /)
-  LOGICAL :: do_init_r0 = .TRUE. 
+  LOGICAL :: do_init_r0 = .TRUE.
   !
+  ! Number of atoms of the QM/MM systems
+  INTEGER  :: nat_mm
+  INTEGER  :: nat_qm
+  INTEGER  :: nat_all
+  INTEGER  :: ntypes
+  !
+  ! Arrays for electrostatic coupling data
   REAL(DP), ALLOCATABLE :: charge(:)
   REAL(DP), ALLOCATABLE :: aradii(:)
   REAL(DP), ALLOCATABLE :: tau_mm(:,:)
@@ -66,12 +72,7 @@ MODULE qmmm
   REAL(DP), ALLOCATABLE :: charge_mm(:)
   REAL(DP), ALLOCATABLE :: mass(:)
   INTEGER, ALLOCATABLE :: types(:)
-  REAL(DP) :: cell_data(9) 
-  REAL(DP) :: cell_mm(9) 
-  INTEGER  :: nat_mm
-  INTEGER  :: nat_qm
-  INTEGER  :: nat_all
-  INTEGER  :: ntypes
+  REAL(DP) :: cell_mm(9)
   !
 
   PUBLIC :: qmmm_config, qmmm_initialization, qmmm_shutdown, qmmm_mode
@@ -107,7 +108,7 @@ CONTAINS
 
     IF (ionode) THEN
         WRITE(stdout,'(/,5X,A)') "QMMM: Initializing QM/MM interface"
-        
+
         IF (qmmm_comm /= MPI_COMM_NULL) THEN
             WRITE(stdout,'(5X,A)') "QMMM: Using MPI based communication"
         ELSE
@@ -149,7 +150,7 @@ CONTAINS
     CALL mp_bcast(nstep, ionode_id, world_comm)
     ! temporary storage
     ALLOCATE( tmp_buf(3,nat_qm) )
-    
+
   END SUBROUTINE qmmm_initialization
 
   !---------------------------------------------------------------------!
@@ -160,7 +161,7 @@ CONTAINS
     USE ions_base, ONLY : tau
     IMPLICIT NONE
     LOGICAL, SAVE::firstexec = .TRUE.
-    INTEGER:: i  
+    INTEGER:: i
     ! New geometric center
     REAL(DP), DIMENSION(3):: gc = (/0.0d0, 0.0d0, 0.0d0/)
     REAL(DP), DIMENSION(3):: qm_bc = (/0.5d0, 0.5d0, 0.5d0/)
@@ -221,7 +222,7 @@ SUBROUTINE qmmm_minimum_image()
   at_mm(3) = (cell_mm(6) - cell_mm(3)) / (cell_mm(4) - cell_mm(1))
   alat_mm = (cell_mm(4) - cell_mm(1)) / bohr_radius_angs
   !
-  DO i = 1,nat_mm 
+  DO i = 1,nat_mm
      s(1) = tau_mm(1,i) - qm_bc(1)
      s(2) = tau_mm(2,i) - qm_bc(2)
      s(3) = tau_mm(3,i) - qm_bc(3)
@@ -236,6 +237,50 @@ SUBROUTINE qmmm_minimum_image()
   !
 END SUBROUTINE qmmm_minimum_image
 
+  !---------------------------------------------------------------------!
+  SUBROUTINE qmmm_allocate_ec(nat_all, nat_qm, nat_mm, ntypes)
+      IMPLICIT NONE
+      INTEGER, INTENT(IN) :: nat_all, nat_qm, nat_mm, ntypes
+      LOGICAL, SAVE :: lalloc = .FALSE.
+
+        IF (lalloc) THEN
+            RETURN
+        ELSE
+            lalloc = .TRUE.
+        END IF
+
+        IF( .NOT. ALLOCATED( rc_mm ) ) THEN
+            ALLOCATE( rc_mm( nat_all ) )
+        END IF
+        IF( .NOT. ALLOCATED( types ) ) THEN
+            ALLOCATE( types( nat_all ) )
+        END IF
+        IF( .NOT. ALLOCATED( force_mm ) ) THEN
+            ALLOCATE( force_mm(3,nat_mm) )
+        END IF
+        IF( .NOT. ALLOCATED( tau_mm ) ) THEN
+            ALLOCATE( tau_mm( 3, nat_mm ) )
+        END IF
+        IF( .NOT. ALLOCATED( tau_mask ) ) THEN
+            ALLOCATE( tau_mask( nat_mm ) )
+        END IF
+        IF( .NOT. ALLOCATED( charge_mm ) ) THEN
+            ALLOCATE( charge_mm( nat_mm ) )
+        END IF
+        IF( .NOT. ALLOCATED( aradii ) ) THEN
+            ALLOCATE( aradii( nat_mm ) )
+        END IF
+        IF( .NOT. ALLOCATED( charge ) ) THEN
+            ALLOCATE( charge(nat_qm) )
+        END IF
+        IF( .NOT. ALLOCATED( force_qm ) ) THEN
+            ALLOCATE( force_qm(3,nat_qm) )
+        END IF
+        IF( .NOT. ALLOCATED( mass ) ) THEN
+            ! add 1 to take into account the atom type "0"
+            ALLOCATE( mass( ntypes + 1 ) )
+        END IF
+  END SUBROUTINE qmmm_allocate_ec
 
   !---------------------------------------------------------------------!
   ! update positions of the QM system from MM-master
@@ -257,11 +302,11 @@ END SUBROUTINE qmmm_minimum_image
          INTEGER(kind=c_int), INTENT(IN) :: nat_mm, ntypes, flag
        END SUBROUTINE ec_fill_radii
     END INTERFACE
-    
+
     IF (qmmm_mode < 0) RETURN
 
 #if defined(__MPI)
-   
+
     IF (ionode .and. (qmmm_verb > 0)) &
         WRITE(stdout,'(/,5X,A)') 'QMMM: update positions'
 
@@ -280,118 +325,109 @@ END SUBROUTINE qmmm_minimum_image
         WRITE(stdout,*) '    QMMM: ntypes  = ', ntypes  ! num_mm in lammps
     END IF
 
+    IF (qmmm_mode == 1) THEN
+        IF (ionode) THEN
+            CALL mpi_recv(tau(1,1),3*nat_qm,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
 
-    IF( .NOT. ALLOCATED( rc_mm ) ) THEN
-        ALLOCATE( rc_mm( nat_all ) )
+            ! convert from angstrom to alat units
+            tau = tau / (alat * bohr_radius_angs)
+
+            CALL qmmm_center_molecule
+
+            WRITE(stdout,*)
+            DO i = 1, nat_qm
+                WRITE(stdout,'(5X,A,3F10.6)') &
+                    'QMMM: tau    ',tau(:,i)
+            END DO
+        END IF
+
+        CALL mp_bcast(tau, ionode_id, world_comm)
+
+    ELSE
+
+        CALL qmmm_allocate_ec(nat_all, nat_qm, nat_mm, ntypes)
+
+        ! Receive coordinates (from LAMMPS) and broadcast to all processors
+        IF (ionode) THEN
+
+            CALL mpi_recv( cell_mm, 9, MPI_DOUBLE_PRECISION, &
+                  0, QMMM_TAG_CELL, qmmm_comm, MPI_STATUS_IGNORE, ierr )
+
+            CALL mpi_recv(tau(1,1),3*nat_qm,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(charge(1),nat_qm,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_CHARGE,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(charge_mm(1),nat_all,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(tau_mm(1,1),3*nat_all,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(tau_mask(1),nat_all,MPI_INTEGER, &
+                  0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(types(1),nat_all,MPI_INTEGER, &
+                  0,QMMM_TAG_TYPE,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            CALL mpi_recv(mass(1),ntypes+1,MPI_DOUBLE_PRECISION, &
+                  0,QMMM_TAG_MASS,qmmm_comm,MPI_STATUS_IGNORE,ierr)
+
+            ! convert from angstrom to alat units
+            tau = tau / (alat * bohr_radius_angs)
+
+            tau_mm = tau_mm / (alat * bohr_radius_angs)
+
+            CALL qmmm_center_molecule
+            CALL qmmm_minimum_image
+
+            ! set atomic radii
+            CALL ec_fill_radii( aradii, nat_mm, mass, types, ntypes, 1 )
+
+        END IF
+
+        CALL mp_bcast(cell_mm, ionode_id, world_comm )
+        CALL mp_bcast(aradii, ionode_id, world_comm)
+        CALL mp_bcast(tau, ionode_id, world_comm)
+        CALL mp_bcast(charge, ionode_id, world_comm)
+        CALL mp_bcast(charge_mm, ionode_id, world_comm)
+        CALL mp_bcast(tau_mm, ionode_id, world_comm)
+        CALL mp_bcast(tau_mask, ionode_id, world_comm)
+        CALL mp_bcast(types, ionode_id, world_comm)
+        CALL mp_bcast(mass, ionode_id, world_comm)
+
+        ! clear charge for QM atoms
+        DO i = 1, nat_mm
+           IF(tau_mask(i) .eq. -1)CYCLE
+           charge_mm(i) = 0.0d0
+        ENDDO
+
+        rc_mm = aradii
+        ! Convert radii to Bohr units
+        rc_mm = rc_mm / (alat * bohr_radius_angs)
+
+        IF (ionode) THEN
+           WRITE(stdout,*)
+           WRITE(stdout,'(5X,A)') 'QMMM: cell_mm'
+           WRITE(stdout,'(11X,A,3F6.3)') 'X (lo,hi,len): ',cell_mm(1),cell_mm(4),cell_mm(4)-cell_mm(1)
+           WRITE(stdout,'(11X,A,3F6.3)') 'Y (lo,hi,len): ',cell_mm(2),cell_mm(5),cell_mm(5)-cell_mm(2)
+           WRITE(stdout,'(11X,A,3F6.3)') 'Z (lo,hi,len): ',cell_mm(3),cell_mm(6),cell_mm(6)-cell_mm(3)
+           WRITE(stdout,'(11X,A,3F6.3)') '  (xy,xz,yz) : ',cell_mm(7),cell_mm(8),cell_mm(9)
+           WRITE(stdout,*)
+           DO i = 1, nat_qm
+               WRITE(stdout,'(5X,A,3F10.6,2X,A,F10.6)') &
+                    'QMMM: tau    ',tau(:,i), ' charge    ',charge(i)
+           END DO
+           WRITE(stdout,*)
+           DO i = 1, nat_all
+               WRITE(stdout,'(5X,A,3F10.6,2X,A,F10.6,2X,A,I2)') &
+                    'QMMM: tau_mm ',tau_mm(:,i),' charge_mm ',charge_mm(i),' QA ',tau_mask(i)
+           END DO
+        END IF
+
     END IF
-    IF( .NOT. ALLOCATED( tau_mm ) ) THEN
-        ALLOCATE( tau_mm( 3, nat_mm ) ) 
-    END IF
-    IF( .NOT. ALLOCATED( tau_mask ) ) THEN
-        ALLOCATE( tau_mask( nat_mm ) ) 
-    END IF
-    IF( .NOT. ALLOCATED( charge_mm ) ) THEN
-        ALLOCATE( charge_mm( nat_mm ) ) 
-    END IF
-    IF( .NOT. ALLOCATED( aradii ) ) THEN
-        ALLOCATE( aradii( nat_mm ) ) 
-    END IF
-    IF( .NOT. ALLOCATED( charge ) ) THEN
-        ALLOCATE( charge(nat_qm) )
-    END IF
-    IF( .NOT. ALLOCATED( force_qm ) ) THEN
-        ALLOCATE( force_qm(3,nat_qm) )
-    END IF
-    IF( .NOT. ALLOCATED( force_mm ) ) THEN
-        ALLOCATE( force_mm(3,nat_mm) )
-    END IF
-    IF( .NOT. ALLOCATED( types ) ) THEN
-        ALLOCATE( types( nat_all ) )
-    END IF
-    IF( .NOT. ALLOCATED( mass ) ) THEN
-        ! add 1 to take into account the atom type "0"
-        ALLOCATE( mass( ntypes + 1 ) ) 
-    END IF
-
-    ! Receive coordinates (from LAMMPS) and broadcast to all processors
-    IF (ionode) THEN
-
-        CALL mpi_recv( cell_mm, 9, MPI_DOUBLE_PRECISION, &
-              0, QMMM_TAG_CELL, qmmm_comm, MPI_STATUS_IGNORE, ierr )
-
-        CALL mpi_recv(tau(1,1),3*nat_qm,MPI_DOUBLE_PRECISION, &
-              0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
- 
-        CALL mpi_recv(charge(1),nat_qm,MPI_DOUBLE_PRECISION, &
-              0,QMMM_TAG_CHARGE,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        CALL mpi_recv(charge_mm(1),nat_all,MPI_DOUBLE_PRECISION, &
-              0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        CALL mpi_recv(tau_mm(1,1),3*nat_all,MPI_DOUBLE_PRECISION, &
-              0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        CALL mpi_recv(tau_mask(1),nat_all,MPI_INTEGER, &
-              0,QMMM_TAG_COORD,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        CALL mpi_recv(types(1),nat_all,MPI_INTEGER, &
-              0,QMMM_TAG_TYPE,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        CALL mpi_recv(mass(1),ntypes+1,MPI_DOUBLE_PRECISION, &
-              0,QMMM_TAG_MASS,qmmm_comm,MPI_STATUS_IGNORE,ierr)
-
-        ! convert from angstrom to alat units
-        tau = tau / (alat * bohr_radius_angs)
-
-        tau_mm = tau_mm / (alat * bohr_radius_angs)
-
-        CALL qmmm_center_molecule
-        CALL qmmm_minimum_image
-
-        ! set atomic radii
-        CALL ec_fill_radii( aradii, nat_mm, mass, types, ntypes, 1 )
-
-    END IF
-
-    CALL mp_bcast(cell_mm, ionode_id, world_comm )
-    CALL mp_bcast(aradii, ionode_id, world_comm)    
-    CALL mp_bcast(tau, ionode_id, world_comm)
-    CALL mp_bcast(charge, ionode_id, world_comm)    
-    CALL mp_bcast(charge_mm, ionode_id, world_comm)    
-    CALL mp_bcast(tau_mm, ionode_id, world_comm)    
-    CALL mp_bcast(tau_mask, ionode_id, world_comm)    
-    CALL mp_bcast(types, ionode_id, world_comm)    
-    CALL mp_bcast(mass, ionode_id, world_comm)    
-
-    ! clear charge for QM atoms
-    DO i = 1, nat_mm
-       IF(tau_mask(i) .eq. -1)CYCLE
-       charge_mm(i) = 0.0d0
-    ENDDO
-
-    rc_mm = aradii
-    ! Convert radii to Bohr units
-    rc_mm = rc_mm / (alat * bohr_radius_angs)
-
-    IF (ionode) THEN
-       WRITE(stdout,*)
-       WRITE(stdout,'(5X,A)') 'QMMM: cell_mm'
-       WRITE(stdout,'(11X,A,3F6.3)') 'X (lo,hi,len): ',cell_mm(1),cell_mm(4),cell_mm(4)-cell_mm(1)
-       WRITE(stdout,'(11X,A,3F6.3)') 'Y (lo,hi,len): ',cell_mm(2),cell_mm(5),cell_mm(5)-cell_mm(2)
-       WRITE(stdout,'(11X,A,3F6.3)') 'Z (lo,hi,len): ',cell_mm(3),cell_mm(6),cell_mm(6)-cell_mm(3)
-       WRITE(stdout,'(11X,A,3F6.3)') '  (xy,xz,yz) : ',cell_mm(7),cell_mm(8),cell_mm(9)
-       WRITE(stdout,*)
-       DO i = 1, nat_qm
-           WRITE(stdout,'(5X,A,3F10.6,2X,A,F10.6)') &
-                'QMMM: tau    ',tau(:,i), ' charge    ',charge(i)
-       END DO
-       WRITE(stdout,*)
-       DO i = 1, nat_all
-           WRITE(stdout,'(5X,A,3F10.6,2X,A,F10.6,2X,A,I2)') &
-                'QMMM: tau_mm ',tau_mm(:,i),' charge_mm ',charge_mm(i),' QA ',tau_mask(i)
-       END DO
-    END IF
-
 
 #else
     CALL errore( 'qmmm_update_positions', 'Use of QM/MM requires compilation with MPI', 1 )
@@ -426,15 +462,14 @@ END SUBROUTINE qmmm_minimum_image
         ! convert from atomic to real units
         IF( qmmm_mode == 2 ) THEN
            tmp_buf = (force + force_qm) * QMMM_FORCE_CONV
+           CALL mpi_send(tmp_buf,3*nat_qm,MPI_DOUBLE_PRECISION, 0,QMMM_TAG_FORCE,qmmm_comm,ierr)
+           force_mm = force_mm * QMMM_FORCE_CONV
+           CALL mpi_send(force_mm,3*nat_mm,MPI_DOUBLE_PRECISION, 0,QMMM_TAG_FORCE2,qmmm_comm,ierr)
         ELSE
            tmp_buf = force * QMMM_FORCE_CONV
+           CALL mpi_send(tmp_buf,3*nat_qm,MPI_DOUBLE_PRECISION, 0,QMMM_TAG_FORCE,qmmm_comm,ierr)
         END IF
 
-        CALL mpi_send(tmp_buf,3*nat_qm,MPI_DOUBLE_PRECISION, 0,QMMM_TAG_FORCE,qmmm_comm,ierr)
-        !
-        !!!! Note, not used if ec_alg is false. Optimize excluding this send as well
-        force_mm = force_mm * QMMM_FORCE_CONV
-        CALL mpi_send(force_mm,3*nat_mm,MPI_DOUBLE_PRECISION, 0,QMMM_TAG_FORCE2,qmmm_comm,ierr)
     END IF
 #else
     CALL errore( 'qmmm_update_forces', 'Use of QM/MM requires compilation with MPI', 1 )
@@ -447,7 +482,7 @@ END SUBROUTINE qmmm_minimum_image
   SUBROUTINE qmmm_add_esf( vltot, dfftp )
     !--------------------------------------------------------------------------
     !
-    !   This routine adds an electrostatic field due to MM atoms to the 
+    !   This routine adds an electrostatic field due to MM atoms to the
     !   local potential.
     !
     USE cell_base,          ONLY : alat, at, omega
@@ -489,7 +524,7 @@ END SUBROUTINE qmmm_minimum_image
     r_nn = 50000.d0 ! cut-off for the nearest neighbour
     !
     r(:) = 0.d0
-    ! 
+    !
     DO ir = 1, dfftp%nnr
        idx = ir -1
        k   = idx / (dfftp%nr1x * dfftp%my_nr2p )
@@ -508,11 +543,11 @@ END SUBROUTINE qmmm_minimum_image
        s(3) = DBLE(k)/DBLE(dfftp%nr3)
        !
        r=matmul(at,s)
-       ! 
+       !
        ! Clear the contribute (it's an accumulator)
        esfcontrib = 0.0D0
        !
-       DO i_mm = 1, nat_mm 
+       DO i_mm = 1, nat_mm
 
           if(tau_mask(i_mm) .ne. -1)cycle ! only MM atoms contribute to ESF
 
@@ -558,7 +593,7 @@ END SUBROUTINE qmmm_minimum_image
                       (tau_mm(3, i_mm) - tau_mm(3, i_qm))**2)
 
                 fder = ( 5.d0*(dist**4)*( rc_mm(i_mm)**4 - dist**4 ) -   &
-                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / & 
+                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / &
                             ( ( rc_mm(i_mm)**5 - dist**5 )**2 )
                 DO ipol = 1,3
                       force_qm(ipol,ii_qm) = force_qm(ipol,ii_qm) -  &
@@ -570,16 +605,16 @@ END SUBROUTINE qmmm_minimum_image
     ENDDO
 
     force_qm=force_qm/(alat**2)
-    
+
     !write(stdout, *) "NEW Forces added to QM atoms (Ry / a.u.)"
     !DO i_qm = 1, nat_mm
     !   write(stdout, '(I5, I5, f11.7, f11.7, f11.7, f11.7)') &
     !        i_qm, tau_mask(i_qm),zv(tau_mask(i_qm)),force_qm(IDX1D(1,i_qm): IDX1D(3,i_qm))
     !ENDDO
     !write(stdout, *) "End of NEW forces added to QM atoms (Ry / a.u.)"
-    
+
     DEALLOCATE( esfcontrib_all )
-    
+
     !IF (ionode) THEN
     !PRINT *,"****** END OF ADD_ESF COMPUTATION ******"
     !ENDIF
@@ -594,7 +629,7 @@ END SUBROUTINE qmmm_minimum_image
     !
     !   This routine computes the forces on the MM atoms due to the QM part
     !
-    
+
     USE cell_base,          ONLY : alat, at, omega
     USE fft_types,          ONLY : fft_type_descriptor
     USE constants,          ONLY : e2, eps8
@@ -627,7 +662,7 @@ END SUBROUTINE qmmm_minimum_image
     !
     force_mm = 0.d0
     !
-    ! Compute forces on MM atoms due to valence electrons 
+    ! Compute forces on MM atoms due to valence electrons
     !
     DO i_mm = 1, nat_mm
        !
@@ -661,7 +696,7 @@ END SUBROUTINE qmmm_minimum_image
              !  see equation (3) from  j.chem. phys 116 by Laio
              !
              fder = ( 5.d0*(dist**4)*( rc_mm(i_mm)**4 - dist**4 ) -   &
-                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / & 
+                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / &
                             ( ( rc_mm(i_mm)**5 - dist**5 )**2 )
              !
              DO ipol = 1,3
@@ -676,7 +711,7 @@ END SUBROUTINE qmmm_minimum_image
        force_mm(2,i_mm) = force_mm(2,i_mm) * charge_mm(i_mm)
        force_mm(3,i_mm) = force_mm(3,i_mm) * charge_mm(i_mm)
     END DO
-    ! 
+    !
     CALL mp_sum(force_mm, intra_pool_comm)
     !
     force_mm(:,:) = e2*force_mm(:,:)*omega/(dfftp%nr1*dfftp%nr2*dfftp%nr3)
@@ -686,7 +721,7 @@ END SUBROUTINE qmmm_minimum_image
     !DO i_mm = 1, nat_mm
     !   write(stdout, '(I5, f11.7, f11.7, f11.7, f11.7, f11.7, f11.7)') i_mm, force_mm(1:3,i_mm), tau_mm(1:3, i_mm)
     !ENDDO
-    ! 
+    !
     DO i_mm = 1, nat_mm
        if(tau_mask(i_mm) .ne. -1)cycle
        DO i_qm = 1, nat_mm
@@ -695,7 +730,7 @@ END SUBROUTINE qmmm_minimum_image
                       (tau_mm(2, i_mm) - tau_mm(2, i_qm))**2 +   &
                       (tau_mm(3, i_mm) - tau_mm(3, i_qm))**2)
           fder = ( 5.d0*(dist**4)*( rc_mm(i_mm)**4 - dist**4 ) -   &
-                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / & 
+                         4.d0*(dist**3)*( rc_mm(i_mm)**5 - dist**5 ) ) / &
                             ( ( rc_mm(i_mm)**5 - dist**5 )**2 )
           DO ipol = 1,3
              force_mm(ipol,i_mm) = force_mm(ipol,i_mm) -  &
@@ -720,7 +755,7 @@ END SUBROUTINE qmmm_minimum_image
     !ENDIF
     !
     RETURN
-    
+
   END SUBROUTINE qmmm_force_esf
 
   !---------------------------------------------------------------------!
@@ -740,9 +775,9 @@ END SUBROUTINE qmmm_minimum_image
     IF( ALLOCATED( tmp_buf ) ) DEALLOCATE( tmp_buf )
     IF( ALLOCATED( rc_mm ) ) DEALLOCATE( rc_mm )
     IF( ALLOCATED( aradii ) ) DEALLOCATE( aradii )
-    IF( ALLOCATED( tau_mm ) ) DEALLOCATE( tau_mm ) 
-    IF( ALLOCATED( tau_mask ) ) DEALLOCATE( tau_mask ) 
-    IF( ALLOCATED( charge_mm ) ) DEALLOCATE( charge_mm ) 
+    IF( ALLOCATED( tau_mm ) ) DEALLOCATE( tau_mm )
+    IF( ALLOCATED( tau_mask ) ) DEALLOCATE( tau_mask )
+    IF( ALLOCATED( charge_mm ) ) DEALLOCATE( charge_mm )
     IF( ALLOCATED( charge ) ) DEALLOCATE( charge )
     IF( ALLOCATED( force_qm ) ) DEALLOCATE( force_qm )
     IF( ALLOCATED( force_mm ) ) DEALLOCATE( force_mm )
