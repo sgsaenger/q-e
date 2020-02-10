@@ -12,6 +12,7 @@ PROGRAM read_ps
   !
   !  Read pseudopotentials in the Unified Pseudopotential Format (UPF)
   !
+  USE pseudo_mod, ONLY: read_pseudo
   IMPLICIT NONE
   INTEGER :: is, ios, iunps = 4
   CHARACTER (len=256) :: filein
