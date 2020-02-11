@@ -302,7 +302,7 @@ subroutine vnonloc (mesh,nkbeta,ipspcod,lpx,psppar,r_l,rr,pot_Dij,lproj,nproj)
       jproj=nfproj
    end if
    lq=lproj(iproj)
-   rnrm=1.d0/dsqrt(.5d0*dgamma(lq+1.5d0+2.d0*jproj-2.d0)*  &
+   rnrm=1.d0/dsqrt(.5d0*gamma(lq+1.5d0+2.d0*jproj-2.d0)*  &
          r_l(lq+1)**(2*lq+3+4*(jproj-1)))
    do imesh=1,mesh
        r=rr(imesh)
