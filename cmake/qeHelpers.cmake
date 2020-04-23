@@ -32,7 +32,8 @@ endfunction(qe_get_fortran_cpp_flag)
 
 function(qe_preprocess_source IN OUT)
     qe_get_fortran_cpp_flag(f_cpp_flag)
-    qe_get_global_compile_definitions(global_defs)
+    get_directory_property(global_defs COMPILE_DEFINITIONS)
+    #qe_get_global_compile_definitions(global_defs)
     foreach(DEF ${global_defs})
         list(APPEND global_flags "-D${DEF}")
     endforeach()
@@ -93,9 +94,6 @@ function(qe_add_library LIB)
 endfunction(qe_add_library)
 
 function(_qe_add_target TGT)
-    if(TARGET QEGlobalCompileDefinitions)
-        target_link_libraries(${TGT} PUBLIC QEGlobalCompileDefinitions)
-    endif()
     qe_fix_fortran_modules(${TGT})
     qe_get_fortran_cpp_flag(f_cpp_flag)
     target_compile_options(${TGT} PRIVATE $<$<COMPILE_LANGUAGE:Fortran>:${f_cpp_flag}>)
@@ -105,8 +103,8 @@ function(qe_install_targets TGT)
     set(targets ${TGT} ${ARGN})
     install(TARGETS ${targets}
         EXPORT qeTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/qe
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/qe
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} # Windows needs RUNTIME also for libraries
         PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/qe/${TGT})
     # Retrieving non-whitelisted properties leads to an hard
@@ -121,7 +119,7 @@ function(qe_install_targets TGT)
             get_target_property(tgt_module_dir ${tgt} Fortran_MODULE_DIRECTORY)
             if(tgt_module_dir)
                 install(DIRECTORY ${tgt_module_dir}/
-                    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/qe/${TGT})
+                    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/qe/${tgt})
             endif()
         endif()        
     endforeach()
